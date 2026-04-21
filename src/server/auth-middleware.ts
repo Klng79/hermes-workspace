@@ -1,10 +1,89 @@
 import { randomBytes, timingSafeEqual } from 'node:crypto'
+import { existsSync, readFileSync, writeFileSync } from 'node:fs'
+import { join } from 'node:path'
 
 /**
- * In-memory session store.
- * For production, consider Redis or a database.
+ * Persistent session token store.
+ *
+ * Tokens are held in memory for fast lookup and persisted to a JSON file
+ * so they survive server restarts.  This is safe for single-instance
+ * deployments.  For multi-worker setups the file becomes a race-condition
+ * window — in that case replace with Redis or a database.
+ *
+ * File location: ~/.hermes/workspace-sessions.json
  */
-const validTokens = new Set<string>()
+interface SessionStore {
+  tokens: Record<string, number> // token -> expiry unix-ms
+}
+
+const STORE_FILE = join(process.env.HERMES_HOME ?? join(process.env.HOME ?? '/root', '.hermes'), 'workspace-sessions.json')
+const TOKEN_TTL_MS = 30 * 24 * 60 * 60 * 1000 // 30 days
+
+function loadStore(): SessionStore {
+  try {
+    if (existsSync(STORE_FILE)) {
+      const raw = readFileSync(STORE_FILE, 'utf8')
+      const parsed = JSON.parse(raw) as SessionStore
+      // Expire any stale tokens on load
+      const now = Date.now()
+      const valid: Record<string, number> = {}
+      for (const [token, expiry] of Object.entries(parsed.tokens)) {
+        if (expiry > now) valid[token] = expiry
+      }
+      return { tokens: valid }
+    }
+  } catch {
+    // Corrupt store — start fresh
+  }
+  return { tokens: {} }
+}
+
+function saveStore(store: SessionStore): void {
+  try {
+    // Ensure directory exists
+    const dir = STORE_FILE.substring(0, STORE_FILE.lastIndexOf('/'))
+    if (!existsSync(dir)) {
+      const { mkdirSync } = require('node:fs')
+      mkdirSync(dir, { recursive: true })
+    }
+    writeFileSync(STORE_FILE, JSON.stringify(store), 'utf8')
+  } catch {
+    // Non-fatal — tokens are still in memory
+    console.warn(`[auth] Failed to persist session store to ${STORE_FILE}`)
+  }
+}
+
+// In-memory working copy
+const _tokens: Map<string, number> = new Map()
+
+// Hydrate from disk on module load
+const initial = loadStore()
+for (const [token, expiry] of Object.entries(initial.tokens)) {
+  _tokens.set(token, expiry)
+}
+
+/**
+ * Prune expired tokens from the store (called on every write + a periodic sweep).
+ */
+function _prune(): void {
+  const now = Date.now()
+  let changed = false
+  for (const [token, expiry] of _tokens) {
+    if (expiry <= now) {
+      _tokens.delete(token)
+      changed = true
+    }
+  }
+  if (changed) _persist()
+}
+
+function _persist(): void {
+  const store: SessionStore = { tokens: Object.fromEntries(_tokens) }
+  saveStore(store)
+}
+
+// Sweep expired tokens every 10 minutes
+setInterval(_prune, 10 * 60 * 1000)
 
 /**
  * Generate a cryptographically secure session token.
@@ -14,24 +93,33 @@ export function generateSessionToken(): string {
 }
 
 /**
- * Store a session token as valid.
+ * Store a session token as valid (30-day TTL).
  */
 export function storeSessionToken(token: string): void {
-  validTokens.add(token)
+  _tokens.set(token, Date.now() + TOKEN_TTL_MS)
+  _persist()
 }
 
 /**
- * Check if a session token is valid.
+ * Check if a session token is valid and not expired.
  */
 export function isValidSessionToken(token: string): boolean {
-  return validTokens.has(token)
+  const expiry = _tokens.get(token)
+  if (expiry === undefined) return false
+  if (expiry <= Date.now()) {
+    _tokens.delete(token)
+    _persist()
+    return false
+  }
+  return true
 }
 
 /**
  * Remove a session token (logout).
  */
 export function revokeSessionToken(token: string): void {
-  validTokens.delete(token)
+  _tokens.delete(token)
+  _persist()
 }
 
 /**
